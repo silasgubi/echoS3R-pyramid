@@ -1,0 +1,1140 @@
+# =============================================================================
+# ECHO PYRAMID - Quarto (Atom EchoS3R + Voice Pyramid Base)
+# =============================================================================
+# Projeto: Nabu Intelligence
+# Versao: 0.3.0
+#
+# Hardware: Atom EchoS3R (C126-ECHO) + Voice Pyramid Base (A167)
+# Localizacao: Quarto
+# Wake Word: Okay Nabu (on-device)
+# Pipeline: Padrao Home Assistant
+# Nota: ENV Pro (BME688) removido em 2026-06-18 (migrado ao carputer).
+#
+# ESTRATEGIA:
+# - Audio usa APENAS componentes da Pyramid (ES7210 + ES8311 + AW87559)
+# - ES8311 + NS4150B internos do EchoS3R desligados (GPIO18 = LOW)
+# - Sem display - feedback via RGB strips da Pyramid
+# - Sem LP5562 (ausente no EchoS3R)
+# - Botao fisico (GPIO41) preservado
+# - IR TX (GPIO47) -> Daikin Split Inverter (protocolo ARC nativo)
+#
+# secrets.yaml: echo_pyramid_api_key / echo_pyramid_ota_password
+#               echo_pyramid_ap_password / wifi_ssid / wifi_password
+# =============================================================================
+
+substitutions:
+  name: echo-pyramid-quarto
+  friendly_name: Echo Pyramid Quarto
+  wake_word_trigger_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
+  timer_finished_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/timer_finished.flac
+  error_cloud_expired_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/error_cloud_expired.mp3
+  stop_model_file: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
+  voice_assist_idle_phase_id: "1"
+  voice_assist_listening_phase_id: "2"
+  voice_assist_thinking_phase_id: "3"
+  voice_assist_replying_phase_id: "4"
+  voice_assist_not_ready_phase_id: "10"
+  voice_assist_error_phase_id: "11"
+  voice_assist_muted_phase_id: "12"
+  voice_assist_timer_finished_phase_id: "20"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2025.11.3
+  on_boot:
+    priority: 600
+    then:
+      - output.turn_off: ns4150b_disable
+      # Anti-estalo: amp OFF; toca som para "primar" codec; liga amp ~80ms depois.
+      - switch.turn_off: speaker_enable
+      - delay: 4s
+      - lambda: 'id(echo_pyramid_player).make_call().set_volume(1.0f).perform();'
+      - script.execute:
+          id: play_sound
+          priority: true
+          sound_file: !lambda return id(wake_word_triggered_sound);
+      - delay: 80ms
+      - switch.turn_on: speaker_enable
+      - delay: 2s
+      - lambda: 'id(echo_pyramid_player).make_call().set_volume(0.3f).perform();'
+      - delay: 23s
+      - if:
+          condition:
+            lambda: return id(init_in_progress);
+          then:
+            - lambda: id(init_in_progress) = false;
+            - script.execute: update_leds
+
+esp32:
+  variant: esp32s3
+  flash_size: 8MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+api:
+  encryption:
+    key: !secret echo_pyramid_api_key
+  on_client_connected:
+    - script.execute: update_leds
+  on_client_disconnected:
+    - script.execute: update_leds
+
+ota:
+  - platform: esphome
+    password: !secret echo_pyramid_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Echo-Pyramid-Quarto Fallback"
+    password: !secret echo_pyramid_ap_password
+  on_connect:
+    - script.execute: update_leds
+  on_disconnect:
+    - script.execute: update_leds
+
+logger:
+  level: DEBUG
+  logs:
+    sensor: WARN
+
+captive_portal:
+
+external_components:
+  # Componente local com dirty flags: elimina I2C storm e flickering intermediario.
+  # Fork de github.com/malonestar/echo-pyramid
+  - source:
+      type: local
+      path: components
+    components: [pyramidrgb]
+  - source: github://m5stack/esphome-yaml/components
+    components: [aw87559, si5351, pyramidtouch]
+    refresh: 0s
+
+i2c:
+  - id: ext_bus
+    sda: GPIO38
+    scl: GPIO39
+    scan: true
+
+pi4ioe5v6408:
+  - id: pi4ioe5v6408_hub
+    i2c_id: ext_bus
+    address: 0x43
+
+aw87559:
+  id: audio_amp
+  i2c_id: ext_bus
+  address: 0x5B
+
+si5351:
+  id: clock_gen
+  i2c_id: ext_bus
+  address: 0x60
+
+i2s_audio:
+  - id: i2s_audio_bus
+    i2s_lrclk_pin: GPIO8
+    i2s_bclk_pin: GPIO6
+
+audio_dac:
+  - platform: es8311
+    id: es8311_dac
+    i2c_id: ext_bus
+    bits_per_sample: 16bit
+    sample_rate: 16000
+
+audio_adc:
+  - platform: es7210
+    id: es7210_adc
+    i2c_id: ext_bus
+    address: 0x40
+    bits_per_sample: 16bit
+    sample_rate: 16000
+
+microphone:
+  - platform: i2s_audio
+    id: i2s_mic
+    sample_rate: 16000
+    i2s_din_pin: GPIO5
+    bits_per_sample: 16bit
+    adc_type: external
+    channel: stereo
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_speaker
+    i2s_dout_pin: GPIO7
+    dac_type: external
+    bits_per_sample: 16bit
+    sample_rate: 16000
+    channel: mono
+    audio_dac: es8311_dac
+
+output:
+  - platform: gpio
+    pin:
+      number: GPIO18
+      mode:
+        output: true
+    id: ns4150b_disable
+    inverted: false
+  - platform: pyramidrgb
+    id: rgb1_ch0_red
+    pyramidrgb_id: pyramid_rgb1
+    channel: 0
+    color: red
+  - platform: pyramidrgb
+    id: rgb1_ch0_green
+    pyramidrgb_id: pyramid_rgb1
+    channel: 0
+    color: green
+  - platform: pyramidrgb
+    id: rgb1_ch0_blue
+    pyramidrgb_id: pyramid_rgb1
+    channel: 0
+    color: blue
+  - platform: pyramidrgb
+    id: rgb1_ch1_red
+    pyramidrgb_id: pyramid_rgb1
+    channel: 1
+    color: red
+  - platform: pyramidrgb
+    id: rgb1_ch1_green
+    pyramidrgb_id: pyramid_rgb1
+    channel: 1
+    color: green
+  - platform: pyramidrgb
+    id: rgb1_ch1_blue
+    pyramidrgb_id: pyramid_rgb1
+    channel: 1
+    color: blue
+  - platform: pyramidrgb
+    id: rgb2_ch2_red
+    pyramidrgb_id: pyramid_rgb2
+    channel: 2
+    color: red
+  - platform: pyramidrgb
+    id: rgb2_ch2_green
+    pyramidrgb_id: pyramid_rgb2
+    channel: 2
+    color: green
+  - platform: pyramidrgb
+    id: rgb2_ch2_blue
+    pyramidrgb_id: pyramid_rgb2
+    channel: 2
+    color: blue
+  - platform: pyramidrgb
+    id: rgb2_ch3_red
+    pyramidrgb_id: pyramid_rgb2
+    channel: 3
+    color: red
+  - platform: pyramidrgb
+    id: rgb2_ch3_green
+    pyramidrgb_id: pyramid_rgb2
+    channel: 3
+    color: green
+  - platform: pyramidrgb
+    id: rgb2_ch3_blue
+    pyramidrgb_id: pyramid_rgb2
+    channel: 3
+    color: blue
+
+pyramidrgb:
+  - id: pyramid_rgb1
+    i2c_id: ext_bus
+    address: 0x1A
+    strip: 1
+    brightness: 80
+  - id: pyramid_rgb2
+    i2c_id: ext_bus
+    address: 0x1A
+    strip: 2
+    brightness: 80
+
+# Mapeamento fisico (olhando de cima, ponta = "frente"):
+#   strip1_group1=back-left | strip1_group2=front-left
+#   strip2_group1=front-right| strip2_group2=back-right
+light:
+  - platform: rgb
+    name: "Strip1 BackLeft"
+    id: strip1_group1
+    red: rgb1_ch0_red
+    green: rgb1_ch0_green
+    blue: rgb1_ch0_blue
+    restore_mode: RESTORE_DEFAULT_ON
+    internal: true
+  - platform: rgb
+    name: "Strip1 FrontLeft"
+    id: strip1_group2
+    red: rgb1_ch1_red
+    green: rgb1_ch1_green
+    blue: rgb1_ch1_blue
+    restore_mode: RESTORE_DEFAULT_ON
+    internal: true
+  - platform: rgb
+    name: "Strip2 FrontRight"
+    id: strip2_group1
+    red: rgb2_ch2_red
+    green: rgb2_ch2_green
+    blue: rgb2_ch2_blue
+    restore_mode: RESTORE_DEFAULT_ON
+    internal: true
+  - platform: rgb
+    name: "Strip2 BackRight"
+    id: strip2_group2
+    red: rgb2_ch3_red
+    green: rgb2_ch3_green
+    blue: rgb2_ch3_blue
+    restore_mode: RESTORE_DEFAULT_ON
+    internal: true
+media_player:
+  - platform: speaker
+    name: "Player"
+    id: echo_pyramid_player
+    volume_min: 0.0
+    volume_max: 0.6
+    volume_initial: 0.3
+    announcement_pipeline:
+      speaker: i2s_speaker
+      format: FLAC
+      sample_rate: 48000
+      num_channels: 1
+    files:
+      - id: wake_word_triggered_sound
+        file: ${wake_word_trigger_sound_file}
+      - id: timer_finished_sound
+        file: ${timer_finished_sound_file}
+      - id: error_cloud_expired
+        file: ${error_cloud_expired_file}
+    on_announcement:
+      - if:
+          condition:
+            - microphone.is_capturing:
+          then:
+            - script.execute: stop_wake_word
+      - if:
+          condition:
+            - lambda: return id(wake_word_engine_location).current_option() == "In Home Assistant";
+          then:
+            - wait_until:
+                - not:
+                    voice_assistant.is_running:
+      - if:
+          condition:
+            not:
+              voice_assistant.is_running:
+          then:
+            - lambda: id(voice_assistant_phase) = ${voice_assist_muted_phase_id};
+            - script.execute: update_leds
+    on_idle:
+      - if:
+          condition:
+            not:
+              voice_assistant.is_running:
+          then:
+            - script.execute: start_wake_word
+            - script.execute: set_idle_or_mute_phase
+            - script.execute: update_leds
+
+button:
+  - platform: factory_reset
+    id: factory_reset_btn
+    internal: true
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO41
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    id: user_button
+    internal: true
+    on_multi_click:
+      - timing:
+          - ON for at most 500ms
+          - OFF for at most 400ms
+          - ON for at most 500ms
+          - OFF for at least 100ms
+        then:
+          - if:
+              condition:
+                switch.is_off: mute
+              then:
+                - script.execute: stop_wake_word
+                - delay: 200ms
+                - voice_assistant.start:
+      - timing:
+          - ON for at most 1s
+          - OFF for at least 50ms
+        then:
+          - if:
+              condition:
+                switch.is_on: timer_ringing
+              then:
+                - switch.turn_off: timer_ringing
+              else:
+                - switch.toggle: mute
+      - timing:
+          - ON for at least 10s
+        then:
+          - button.press: factory_reset_btn
+
+switch:
+  - platform: gpio
+    name: Speaker Enable
+    id: speaker_enable
+    pin:
+      pi4ioe5v6408: pi4ioe5v6408_hub
+      number: 0
+      mode:
+        output: true
+    icon: "mdi:volume-high"
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    name: Mute Microphone
+    id: mute
+    icon: "mdi:microphone-off"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    on_turn_off:
+      - microphone.unmute:
+      - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+      - script.execute: idle_sleep_timer
+      - script.execute: update_leds
+    on_turn_on:
+      - microphone.mute:
+      - lambda: id(voice_assistant_phase) = ${voice_assist_muted_phase_id};
+      - script.execute: update_leds
+
+  - platform: template
+    name: "Luz Noturna"
+    id: night_light
+    icon: "mdi:weather-night"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - script.execute: update_leds
+    on_turn_off:
+      - script.execute: update_leds
+
+  - platform: template
+    id: timer_ringing
+    optimistic: true
+    internal: true
+    restore_mode: ALWAYS_OFF
+    on_turn_off:
+      - lambda: |-
+          id(echo_pyramid_player)
+            ->make_call()
+            .set_command(media_player::MediaPlayerCommand::MEDIA_PLAYER_COMMAND_REPEAT_OFF)
+            .set_announcement(true)
+            .perform();
+          id(echo_pyramid_player)->set_playlist_delay_ms(speaker::AudioPipelineType::ANNOUNCEMENT, 0);
+      - media_player.stop:
+          announcement: true
+      - script.execute: start_wake_word
+    on_turn_on:
+      - script.execute: stop_wake_word
+      - lambda: |-
+          id(echo_pyramid_player)
+            ->make_call()
+            .set_command(media_player::MediaPlayerCommand::MEDIA_PLAYER_COMMAND_REPEAT_ONE)
+            .set_announcement(true)
+            .perform();
+          id(echo_pyramid_player)->set_playlist_delay_ms(speaker::AudioPipelineType::ANNOUNCEMENT, 1000);
+      - media_player.speaker.play_on_device_media_file:
+          media_file: timer_finished_sound
+          announcement: true
+      - delay: 15min
+      - switch.turn_off: timer_ringing
+
+select:
+  - platform: template
+    entity_category: config
+    name: Wake word engine location
+    id: wake_word_engine_location
+    icon: "mdi:account-voice"
+    optimistic: true
+    restore_value: true
+    options:
+      - In Home Assistant
+      - On device
+    initial_option: On device
+    on_value:
+      - if:
+          condition:
+            lambda: return !id(init_in_progress);
+          then:
+            - wait_until:
+                lambda: return id(voice_assistant_phase) == ${voice_assist_muted_phase_id} || id(voice_assistant_phase) == ${voice_assist_idle_phase_id};
+            - if:
+                condition:
+                  lambda: return x == "In Home Assistant";
+                then:
+                  - micro_wake_word.stop
+                  - delay: 500ms
+                  - if:
+                      condition:
+                        switch.is_off: mute
+                      then:
+                        - lambda: id(va).set_use_wake_word(true);
+                        - voice_assistant.start_continuous:
+            - if:
+                condition:
+                  lambda: return x == "On device";
+                then:
+                  - lambda: id(va).set_use_wake_word(false);
+                  - voice_assistant.stop
+                  - delay: 500ms
+                  - if:
+                      condition:
+                        switch.is_off: mute
+                      then:
+                        - micro_wake_word.start
+
+  - platform: template
+    name: "Wake word sensitivity"
+    optimistic: true
+    initial_option: Slightly sensitive
+    restore_value: true
+    entity_category: config
+    options:
+      - Slightly sensitive
+      - Moderately sensitive
+      - Very sensitive
+    on_value:
+      lambda: |-
+        if (x == "Slightly sensitive") {
+          id(okay_nabu).set_probability_cutoff(217);
+          id(hey_jarvis).set_probability_cutoff(247);
+          id(hey_mycroft).set_probability_cutoff(253);
+        } else if (x == "Moderately sensitive") {
+          id(okay_nabu).set_probability_cutoff(176);
+          id(hey_jarvis).set_probability_cutoff(235);
+          id(hey_mycroft).set_probability_cutoff(242);
+        } else if (x == "Very sensitive") {
+          id(okay_nabu).set_probability_cutoff(143);
+          id(hey_jarvis).set_probability_cutoff(212);
+          id(hey_mycroft).set_probability_cutoff(237);
+        }
+
+micro_wake_word:
+  id: mww
+  microphone: i2s_mic
+  models:
+    - model: okay_nabu
+      id: okay_nabu
+    - model: hey_jarvis
+      id: hey_jarvis
+    - model: hey_mycroft
+      id: hey_mycroft
+    - model: ${stop_model_file}
+      id: stop
+      internal: true
+  vad:
+  on_wake_word_detected:
+    # Toca o chime ANTES de iniciar o VA. LED sweep em paralelo (so GPIO, sem conflito
+    # de audio). wait_until duplo garante que o I2S bus esteja livre antes de ligar o
+    # microfone -- evita travamento de codec (mic+speaker dividem ES8311, AEC fraco).
+    - script.execute: wake_from_sleep
+    - script.execute:
+        id: play_sound
+        priority: true
+        sound_file: !lambda return id(wake_word_triggered_sound);
+    - script.execute: wake_word_sweep
+    - wait_until:
+        condition:
+          - media_player.is_announcing:
+        timeout: 0.5s
+    - wait_until:
+        - and:
+            - not:
+                media_player.is_announcing:
+            - not:
+                speaker.is_playing:
+    - voice_assistant.start:
+        wake_word: !lambda return wake_word;
+
+voice_assistant:
+  id: va
+  microphone: i2s_mic
+  media_player: echo_pyramid_player
+  micro_wake_word: mww
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
+  volume_multiplier: 2.0
+  on_listening:
+    - script.execute: wake_from_sleep
+    - lambda: id(voice_assistant_phase) = ${voice_assist_listening_phase_id};
+    - script.execute: update_leds
+    - script.execute: listening_pulse
+  on_stt_vad_end:
+    - script.stop: listening_pulse
+    - lambda: id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
+    - script.execute: update_leds
+    - script.execute: thinking_animation
+  on_tts_start:
+    - script.stop: thinking_animation
+    - lambda: id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+    - script.execute: update_leds
+  on_end:
+    - wait_until:
+        condition:
+          - media_player.is_announcing:
+        timeout: 0.5s
+    - wait_until:
+        - and:
+            - not:
+                media_player.is_announcing:
+            - not:
+                speaker.is_playing:
+    - if:
+        condition:
+          - lambda: return id(wake_word_engine_location).current_option() == "On device";
+        then:
+          - lambda: id(va).set_use_wake_word(false);
+          - micro_wake_word.start:
+    - script.execute: set_idle_or_mute_phase
+    - script.execute: update_leds
+  on_error:
+    - if:
+        condition:
+          and:
+            - lambda: return !id(init_in_progress);
+            - lambda: return code != "duplicate_wake_up_detected";
+            - lambda: return code != "stt-no-text-recognized";
+        then:
+          - lambda: id(voice_assistant_phase) = ${voice_assist_error_phase_id};
+          - script.execute: update_leds
+          - delay: 1s
+          - if:
+              condition:
+                switch.is_off: mute
+              then:
+                - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+              else:
+                - lambda: id(voice_assistant_phase) = ${voice_assist_muted_phase_id};
+          - script.execute: update_leds
+    - if:
+        condition:
+          - lambda: return code == "cloud-auth-failed";
+        then:
+          - script.execute:
+              id: play_sound
+              priority: true
+              sound_file: !lambda return id(error_cloud_expired);
+  on_client_connected:
+    - lambda: id(init_in_progress) = false;
+    - script.execute: start_wake_word
+    - script.execute: set_idle_or_mute_phase
+    - script.execute: update_leds
+  on_client_disconnected:
+    - script.execute: stop_wake_word
+    - lambda: id(voice_assistant_phase) = ${voice_assist_not_ready_phase_id};
+    - script.execute: update_leds
+  on_timer_finished:
+    - switch.turn_on: timer_ringing
+    - wait_until:
+        media_player.is_announcing:
+    - lambda: id(voice_assistant_phase) = ${voice_assist_timer_finished_phase_id};
+    - script.execute: update_leds
+
+globals:
+  - id: init_in_progress
+    type: bool
+    restore_value: false
+    initial_value: "true"
+  - id: voice_assistant_phase
+    type: int
+    restore_value: false
+    initial_value: ${voice_assist_not_ready_phase_id}
+  - id: current_volume
+    type: float
+    restore_value: true
+    initial_value: '0.3'
+
+# Touch 3 e 4 desativados (comportamento erratico -- TSC/AEC do STM32).
+# Swipe esquerda: up=vol+, down=vol-. Swipe direita: ignorado.
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: pyramidtouch
+    id: pyramid_touch
+    address: 0x1A
+    i2c_id: ext_bus
+    update_interval: 50ms
+    publish_swipe_event: true
+    swipe_timeout_ms: 500
+    touch1:
+      name: "Touch 1"
+      id: touch_strip_1
+    touch2:
+      name: "Touch 2"
+      id: touch_strip_2
+    touch3:
+      name: "Touch 3"
+      id: touch_strip_3
+    touch4:
+      name: "Touch 4"
+      id: touch_strip_4
+    swipe_event:
+      name: "Touch Swipe Event"
+      entity_category: diagnostic
+      on_value:
+        then:
+          - lambda: |-
+              // 1=Left Up (vol+) | 2=Left Down (vol-) | 3/4=Right (ignorado, touch 3/4 erratico)
+              const float step = 0.05f;
+              const int ev = (int) x;
+              if (ev == 1 || ev == 2) {
+                float v = id(current_volume);
+                v = (ev == 1) ? std::min(1.0f, v + step) : std::max(0.0f, v - step);
+                auto call = id(echo_pyramid_player).make_call();
+                call.set_volume(v);
+                call.perform();
+                id(current_volume) = v;
+              }
+
+number:
+  - platform: template
+    name: "Master Volume"
+    id: master_volume
+    icon: "mdi:volume-high"
+    min_value: 0.0
+    max_value: 0.6
+    step: 0.01
+    restore_value: true
+    initial_value: 0.3
+    optimistic: true
+    set_action:
+      - lambda: |-
+          float v = x;
+          auto call = id(echo_pyramid_player).make_call();
+          call.set_volume(v);
+          call.perform();
+          id(current_volume) = v;
+
+  - platform: template
+    name: "RGB Master Brightness"
+    id: rgb_master_brightness
+    icon: "mdi:brightness-6"
+    min_value: 0
+    max_value: 100
+    step: 1
+    restore_value: true
+    initial_value: 100
+    optimistic: true
+    set_action:
+      - script.execute: update_leds
+
+remote_transmitter:
+  id: remote_transmitter_gpio47
+  pin:
+    number: GPIO47
+    inverted: false
+  carrier_duty_percent: 50%
+  non_blocking: false
+
+climate:
+  - platform: daikin
+    name: "Ar Condicionado Quarto"
+    transmitter_id: remote_transmitter_gpio47
+script:
+  - id: start_wake_word
+    then:
+      - if:
+          condition:
+            and:
+              - not:
+                  - voice_assistant.is_running:
+              - lambda: return id(wake_word_engine_location).current_option() == "On device";
+          then:
+            - lambda: id(va).set_use_wake_word(false);
+            - micro_wake_word.start:
+      - if:
+          condition:
+            and:
+              - not:
+                  - voice_assistant.is_running:
+              - lambda: return id(wake_word_engine_location).current_option() == "In Home Assistant";
+          then:
+            - lambda: id(va).set_use_wake_word(true);
+            - voice_assistant.start_continuous:
+
+  - id: stop_wake_word
+    then:
+      - if:
+          condition:
+            lambda: return id(wake_word_engine_location).current_option() == "In Home Assistant";
+          then:
+            - lambda: id(va).set_use_wake_word(false);
+            - voice_assistant.stop:
+      - if:
+          condition:
+            lambda: return id(wake_word_engine_location).current_option() == "On device";
+          then:
+            - micro_wake_word.stop:
+
+  - id: set_idle_or_mute_phase
+    then:
+      - if:
+          condition:
+            switch.is_off: mute
+          then:
+            - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+            - script.execute: idle_sleep_timer
+          else:
+            - lambda: id(voice_assistant_phase) = ${voice_assist_muted_phase_id};
+
+  - id: play_sound
+    parameters:
+      priority: bool
+      sound_file: "audio::AudioFile*"
+    then:
+      - lambda: |-
+          if (priority) {
+            id(echo_pyramid_player)
+              ->make_call()
+              .set_command(media_player::MediaPlayerCommand::MEDIA_PLAYER_COMMAND_STOP)
+              .set_announcement(true)
+              .perform();
+          }
+          if ( (id(echo_pyramid_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING ) || priority) {
+            id(echo_pyramid_player)->play_file(sound_file, true, false);
+          }
+
+  # Aplica cor/transicao por fase. Suspende touch durante voz ativa.
+  - id: update_leds
+    then:
+      - if:
+          condition:
+            lambda: return !id(init_in_progress);
+          then:
+            - lambda: |-
+                auto set_strip = [](light::LightState* l, float r, float g, float b, float brightness, uint32_t t) {
+                  auto call = l->turn_on();
+                  call.set_rgb(r, g, b); call.set_brightness(brightness); call.set_transition_length(t);
+                  call.perform();
+                };
+                auto strip_off = [](light::LightState* l, uint32_t t) {
+                  auto call = l->turn_off(); call.set_transition_length(t); call.perform();
+                };
+                switch(id(voice_assistant_phase)) {
+                  case ${voice_assist_idle_phase_id}:
+                  default:
+                    if (id(night_light).state) {
+                      float s = id(rgb_master_brightness).state / 100.0f;
+                      float bright = std::max(0.02f, s * s * 0.85f);
+                      set_strip(id(strip1_group1), 1.0f, 0.55f, 0.05f, bright, 1000);
+                      set_strip(id(strip1_group2), 1.0f, 0.55f, 0.05f, bright, 1000);
+                      set_strip(id(strip2_group1), 1.0f, 0.55f, 0.05f, bright, 1000);
+                      set_strip(id(strip2_group2), 1.0f, 0.55f, 0.05f, bright, 1000);
+                    } else {
+                      strip_off(id(strip1_group1), 1000); strip_off(id(strip1_group2), 1000);
+                      strip_off(id(strip2_group1), 1000); strip_off(id(strip2_group2), 1000);
+                    }
+                    break;
+                  case ${voice_assist_listening_phase_id}:
+                    set_strip(id(strip1_group2), 0.0f, 0.8f, 1.0f, 0.90f, 200);
+                    set_strip(id(strip2_group1), 0.0f, 0.8f, 1.0f, 0.90f, 200);
+                    set_strip(id(strip1_group1), 0.0f, 0.8f, 1.0f, 0.50f, 200);
+                    set_strip(id(strip2_group2), 0.0f, 0.8f, 1.0f, 0.50f, 200);
+                    break;
+                  case ${voice_assist_thinking_phase_id}:
+                    set_strip(id(strip1_group1), 1.0f, 0.90f, 0.0f, 0.65f, 400);
+                    set_strip(id(strip1_group2), 1.0f, 0.90f, 0.0f, 0.65f, 400);
+                    set_strip(id(strip2_group1), 1.0f, 0.90f, 0.0f, 0.65f, 400);
+                    set_strip(id(strip2_group2), 1.0f, 0.90f, 0.0f, 0.65f, 400);
+                    break;
+                  case ${voice_assist_replying_phase_id}:
+                    set_strip(id(strip1_group1), 0.0f, 1.0f, 0.3f, 0.70f, 300);
+                    set_strip(id(strip1_group2), 0.0f, 1.0f, 0.3f, 0.70f, 300);
+                    set_strip(id(strip2_group1), 0.0f, 1.0f, 0.3f, 0.70f, 300);
+                    set_strip(id(strip2_group2), 0.0f, 1.0f, 0.3f, 0.70f, 300);
+                    break;
+                  case ${voice_assist_not_ready_phase_id}:
+                    strip_off(id(strip1_group1), 500); strip_off(id(strip1_group2), 500);
+                    strip_off(id(strip2_group1), 500); strip_off(id(strip2_group2), 500);
+                    break;
+                  case ${voice_assist_error_phase_id}:
+                    set_strip(id(strip1_group1), 1.0f, 0.0f, 0.0f, 0.85f, 100);
+                    set_strip(id(strip1_group2), 1.0f, 0.0f, 0.0f, 0.85f, 100);
+                    set_strip(id(strip2_group1), 1.0f, 0.0f, 0.0f, 0.85f, 100);
+                    set_strip(id(strip2_group2), 1.0f, 0.0f, 0.0f, 0.85f, 100);
+                    break;
+                  case ${voice_assist_muted_phase_id}:
+                    set_strip(id(strip1_group1), 0.8f, 0.0f, 0.4f, 0.06f, 400);
+                    set_strip(id(strip1_group2), 0.8f, 0.0f, 0.4f, 0.06f, 400);
+                    set_strip(id(strip2_group1), 0.8f, 0.0f, 0.4f, 0.06f, 400);
+                    set_strip(id(strip2_group2), 0.8f, 0.0f, 0.4f, 0.06f, 400);
+                    break;
+                  case ${voice_assist_timer_finished_phase_id}:
+                    set_strip(id(strip1_group1), 1.0f, 0.3f, 0.0f, 0.95f, 100);
+                    set_strip(id(strip1_group2), 1.0f, 0.3f, 0.0f, 0.95f, 100);
+                    set_strip(id(strip2_group1), 1.0f, 0.3f, 0.0f, 0.95f, 100);
+                    set_strip(id(strip2_group2), 1.0f, 0.3f, 0.0f, 0.95f, 100);
+                    break;
+                }
+            - if:
+                condition:
+                  lambda: return id(voice_assistant_phase) == ${voice_assist_idle_phase_id};
+                then:
+                  - component.resume: pyramid_touch
+                else:
+                  - component.suspend: pyramid_touch
+
+  # Sweep branco de tras->frente (back corners primeiro, depois frente). Paralelo ao chime.
+  - id: wake_word_sweep
+    then:
+      - light.turn_on:
+          id: strip1_group1
+          red: 1.0
+          green: 1.0
+          blue: 1.0
+          brightness: 1.0
+          transition_length: 40ms
+      - light.turn_on:
+          id: strip2_group2
+          red: 1.0
+          green: 1.0
+          blue: 1.0
+          brightness: 1.0
+          transition_length: 40ms
+      - delay: 110ms
+      - light.turn_on:
+          id: strip1_group2
+          red: 1.0
+          green: 1.0
+          blue: 1.0
+          brightness: 1.0
+          transition_length: 40ms
+      - light.turn_on:
+          id: strip2_group1
+          red: 1.0
+          green: 1.0
+          blue: 1.0
+          brightness: 1.0
+          transition_length: 40ms
+
+  # Breathing ciano enquanto escuta (~2.3s/ciclo). Passos discretos = ~10 writes/s.
+  - id: listening_pulse
+    then:
+      - while:
+          condition:
+            lambda: return id(voice_assistant_phase) == ${voice_assist_listening_phase_id};
+          then:
+            - lambda: |-
+                auto s = [](light::LightState* l, float br) {
+                  auto c = l->turn_on(); c.set_rgb(0.0f, 0.8f, 1.0f);
+                  c.set_brightness(br); c.set_transition_length(0); c.perform();
+                };
+                s(id(strip1_group1), 0.67f); s(id(strip1_group2), 0.67f);
+                s(id(strip2_group1), 0.67f); s(id(strip2_group2), 0.67f);
+            - delay: 310ms
+            - lambda: |-
+                auto s = [](light::LightState* l, float br) {
+                  auto c = l->turn_on(); c.set_rgb(0.0f, 0.8f, 1.0f);
+                  c.set_brightness(br); c.set_transition_length(0); c.perform();
+                };
+                s(id(strip1_group1), 0.83f); s(id(strip1_group2), 0.83f);
+                s(id(strip2_group1), 0.83f); s(id(strip2_group2), 0.83f);
+            - delay: 310ms
+            - lambda: |-
+                auto s = [](light::LightState* l, float br) {
+                  auto c = l->turn_on(); c.set_rgb(0.0f, 0.8f, 1.0f);
+                  c.set_brightness(br); c.set_transition_length(0); c.perform();
+                };
+                s(id(strip1_group1), 1.00f); s(id(strip1_group2), 1.00f);
+                s(id(strip2_group1), 1.00f); s(id(strip2_group2), 1.00f);
+            - delay: 380ms
+            - lambda: |-
+                auto s = [](light::LightState* l, float br) {
+                  auto c = l->turn_on(); c.set_rgb(0.0f, 0.8f, 1.0f);
+                  c.set_brightness(br); c.set_transition_length(0); c.perform();
+                };
+                s(id(strip1_group1), 0.83f); s(id(strip1_group2), 0.83f);
+                s(id(strip2_group1), 0.83f); s(id(strip2_group2), 0.83f);
+            - delay: 367ms
+            - lambda: |-
+                auto s = [](light::LightState* l, float br) {
+                  auto c = l->turn_on(); c.set_rgb(0.0f, 0.8f, 1.0f);
+                  c.set_brightness(br); c.set_transition_length(0); c.perform();
+                };
+                s(id(strip1_group1), 0.67f); s(id(strip1_group2), 0.67f);
+                s(id(strip2_group1), 0.67f); s(id(strip2_group2), 0.67f);
+            - delay: 367ms
+            - lambda: |-
+                auto s = [](light::LightState* l, float br) {
+                  auto c = l->turn_on(); c.set_rgb(0.0f, 0.8f, 1.0f);
+                  c.set_brightness(br); c.set_transition_length(0); c.perform();
+                };
+                s(id(strip1_group1), 0.50f); s(id(strip1_group2), 0.50f);
+                s(id(strip2_group1), 0.50f); s(id(strip2_group2), 0.50f);
+            - delay: 566ms
+
+  # Chase ambar horario enquanto processa (FL->FR->BR->BL, ~760ms/rotacao).
+  - id: thinking_animation
+    then:
+      - while:
+          condition:
+            lambda: return id(voice_assistant_phase) == ${voice_assist_thinking_phase_id};
+          then:
+            - light.turn_on:
+                id: strip1_group2
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.90
+                transition_length: 100ms
+            - light.turn_on:
+                id: strip2_group1
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.70
+                transition_length: 100ms
+            - light.turn_on:
+                id: strip2_group2
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.50
+                transition_length: 100ms
+            - light.turn_on:
+                id: strip1_group1
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.50
+                transition_length: 100ms
+            - delay: 190ms
+            - light.turn_on:
+                id: strip2_group1
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.90
+                transition_length: 100ms
+            - light.turn_on:
+                id: strip2_group2
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.70
+                transition_length: 100ms
+            - light.turn_on:
+                id: strip1_group1
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.50
+                transition_length: 100ms
+            - light.turn_on:
+                id: strip1_group2
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.50
+                transition_length: 100ms
+            - delay: 190ms
+            - light.turn_on:
+                id: strip2_group2
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.90
+                transition_length: 100ms
+            - light.turn_on:
+                id: strip1_group1
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.70
+                transition_length: 100ms
+            - light.turn_on:
+                id: strip1_group2
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.50
+                transition_length: 100ms
+            - light.turn_on:
+                id: strip2_group1
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.50
+                transition_length: 100ms
+            - delay: 190ms
+            - light.turn_on:
+                id: strip1_group1
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.90
+                transition_length: 100ms
+            - light.turn_on:
+                id: strip1_group2
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.70
+                transition_length: 100ms
+            - light.turn_on:
+                id: strip2_group1
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.50
+                transition_length: 100ms
+            - light.turn_on:
+                id: strip2_group2
+                red: 1.0
+                green: 0.90
+                blue: 0.0
+                brightness: 0.50
+                transition_length: 100ms
+            - delay: 190ms
+
+  # Apos 2 min idle, apaga LEDs suavemente. mode:restart reinicia ao haver atividade.
+  - id: idle_sleep_timer
+    mode: restart
+    then:
+      - delay: 2min
+      - if:
+          condition:
+            lambda: return id(voice_assistant_phase) == ${voice_assist_idle_phase_id};
+          then:
+            - light.turn_off:
+                id: strip1_group1
+                transition_length: 3s
+            - light.turn_off:
+                id: strip1_group2
+                transition_length: 3s
+            - light.turn_off:
+                id: strip2_group1
+                transition_length: 3s
+            - light.turn_off:
+                id: strip2_group2
+                transition_length: 3s
+
+  # Acorda do sleep: cancela o timer e restaura o estado de LED.
+  - id: wake_from_sleep
+    then:
+      - script.stop: idle_sleep_timer
+      - script.execute: update_leds
