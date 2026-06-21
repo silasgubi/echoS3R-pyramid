@@ -96,7 +96,7 @@ The upstream `pyramidrgb` component had a flickering issue caused by the way ESP
 
 See [`components/README.md`](components/README.md) for the full technical write-up.
 
-> This component fix was developed on top of the upstream `pyramidrgb` component from [m5stack/esphome-yaml](https://github.com/m5stack/esphome-yaml). Credit to the original authors; the dirty-flag approach and per-LED write pattern are our additions.
+> The `pyramidrgb` fix (dirty flags, per-LED writes, stepped breathing animation) was developed by [malonestar/echo-pyramid](https://github.com/malonestar/echo-pyramid), which itself builds on the original component from [m5stack/esphome-yaml](https://github.com/m5stack/esphome-yaml). We adapted it for the EchoS3R satellite configuration.
 
 ---
 
@@ -147,6 +147,7 @@ secrets.yaml.example        ← Credentials template
 
 ## Credits
 
-- [m5stack/esphome-yaml](https://github.com/m5stack/esphome-yaml) — original `pyramidrgb` component and Pyramid hardware bring-up
+- [malonestar/echo-pyramid](https://github.com/malonestar/echo-pyramid) — primary reference: `pyramidrgb` fix (dirty flags, per-LED writes, stepped animations), voice assistant timing patterns, and Pyramid hardware bring-up. This project would not exist without that work.
+- [m5stack/esphome-yaml](https://github.com/m5stack/esphome-yaml) — original `pyramidrgb` component upstream
 - [ESPHome](https://esphome.io/) — firmware framework
 - [Home Assistant](https://www.home-assistant.io/) — voice pipeline
