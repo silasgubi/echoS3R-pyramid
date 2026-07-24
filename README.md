@@ -228,3 +228,9 @@ secrets.yaml.example        ← Credentials template
 - [m5stack/esphome-yaml](https://github.com/m5stack/esphome-yaml) — original `pyramidrgb` component upstream
 - [ESPHome](https://esphome.io/) — firmware framework
 - [Home Assistant](https://www.home-assistant.io/) — voice pipeline
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
