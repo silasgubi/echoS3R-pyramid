@@ -19,6 +19,17 @@ The EchoS3R mounts into the Pyramid's center slot. The Pyramid adds a quad-mic a
 
 ---
 
+## Features (v0.5.2)
+
+- On-device wake word with `micro_wake_word` (`okay_nabu`, `hey_jarvis`, `hey_mycroft`) and a sensitivity select; the engine can also run in Home Assistant
+- Full voice pipeline with timers, mute switch and button, and a 10 s long press for factory reset
+- 28 individually addressable LEDs with Voice PE-style effects (idle, listening, thinking, timers, errors, offline)
+- Touch volume on the left strip: tap, hold to repeat, swipe, with an LED volume bar
+- Optional "stop" barge-in while the assistant is replying (experimental)
+- Optional IR transmitter for a Daikin AC
+
+---
+
 ## GPIO Map
 
 | GPIO | Function |
@@ -68,32 +79,20 @@ All mic, DAC, and speaker I/O goes through the Pyramid's ES7210 + ES8311 + AW875
 
 The AtomS3R has an LP5562 RGB LED driver used for status indication in the standard firmware. The EchoS3R does not have one. All LED feedback runs through the Pyramid's STM32-controlled strips via the `pyramidrgb` component.
 
-### 3. Wake word chime must be serialized
+### 3. Mic and speaker share ONE I2S bus (no 48 kHz, no overlapping chime)
 
-Playing the chime and starting the voice pipeline simultaneously causes I2S contention on the shared ES8311 codec. The mic (ES7210) and speaker (ES8311) share the same bus and the STM32's AEC is weak — it doesn't cleanly cancel the chime echo, which causes the voice pipeline to hang or the wake word detector to stop responding after a few interactions.
+The mic (ES7210) and the speaker DAC (ES8311) sit on the same I2S bus (BCLK GPIO6 / LRCLK GPIO8), so they share a single sample rate and cannot be driven independently. Two consequences:
 
-The fix is to wait for the chime to complete before starting the pipeline:
+- **Everything runs at 16 kHz.** `micro_wake_word` needs a 16 kHz mic, so the speaker graph is 16 kHz too. The Voice PE can play at 48 kHz only because its XMOS gives it two I2S buses with independent clocks. Set the media player pipelines to `sample_rate: 16000` (FLAC) so Home Assistant resamples TTS on the server instead of downsampling on the device, which sounds muffled.
+- **The wake chime delays listening.** Playing the chime and starting the voice pipeline at the same time makes the mic driver fail and retry (`Driver failed to start; retrying in 1 second`), which cost about 2 s in the logs. The STM32's AEC is also weak, so it does not cleanly cancel the chime echo.
 
-```yaml
-on_wake_word_detected:
-  - script.execute: wake_word_sweep     # LED animation — GPIO only, no I2S conflict
-  - media_player.play_media: !lambda return id(wake_chime_url);
-  - wait_until:
-      condition:
-        media_player.is_announcing: media_player_id
-      timeout: 500ms
-  - wait_until:
-      condition:
-        not:
-          media_player.is_announcing: media_player_id
-  - voice_assistant.start:
-```
+So the firmware has a **Wake Sound** switch that is **OFF by default**: the wake word triggers an LED sweep and listening starts right away. With the switch ON it serializes everything: chime, wait for the announcement to finish, about 700 ms for the I2S TX teardown, then the voice assistant.
 
 > **Rule:** On any device with a shared mic/speaker codec and weak AEC, never fire `voice_assistant.start` while audio is playing.
 
-### 4. Volume: use `volume_max`, avoid dual attenuation
+### 4. Volume: clamp with `volume_max`, avoid dual attenuation
 
-The ES8311 + AW87559 chain distorts above ~60% of full scale. Set `volume_max: 0.6` on the media player and leave it there. Do not add a separate volume number entity that also attenuates — stacking two attenuations (e.g. `set_level(0.05)` × slider) results in barely-visible LEDs or nearly-inaudible audio.
+The ES8311 + AW87559 chain eventually distorts near full scale. Clamp it with `volume_max` on the media player and leave it there. Here it is 0.70, tuned by ear (0.4 and 0.55 were too quiet); if yours distorts at maximum, back off to 0.60-0.65. The standard Home Assistant slider (0-1) then becomes the only volume control. Do not add a separate volume number entity that also attenuates: stacking two attenuations leaves you with nearly inaudible audio or barely visible LEDs.
 
 ### 5. Touch strips use `publish_swipe_event`
 
@@ -108,47 +107,49 @@ Touch 3 and 4 (right strip, STM32 TSC-based) are **disabled** — they behave er
 
 Touch is suspended (`component.suspend`) during all active voice phases and resumed on idle to prevent accidental volume changes mid-conversation.
 
+A short tap on a left pad is one volume step, holding it repeats, and a full swipe adds a bigger jump (taps that belong to a swipe are suppressed). In idle or muted state the LEDs show a volume bar (N of 28 white LEDs for 1.5 s).
+
 ### 6. Don't use `grove_bus` (GPIO1/GPIO2)
 
 Defining a software I2C bus on GPIO1/GPIO2 causes a crash on boot. The ESP-IDF OTA rollback then reverts to the previous firmware silently — you'll see a successful upload followed by the old firmware date in the logs. Use the Pyramid's hardware I2C bus (`ext_bus`, GPIO38/GPIO39) for all Pyramid peripherals including the Grove port.
 
 ### 7. Don't compile with the HA ESPHome Builder add-on
 
-This firmware includes TF Lite Micro for on-device wake word detection. The HA Builder runs on a Raspberry Pi with limited RAM — the compiler (`cc1plus`) gets OOM-killed mid-build. **Always compile on a PC** with the ESPHome CLI and upload via OTA.
+This firmware includes TF Lite Micro for on-device wake word detection. The HA Builder runs on a Raspberry Pi with limited RAM — the compiler (`cc1plus`) gets OOM-killed mid-build. **Always compile on a PC** with the ESPHome CLI and upload via OTA. For the same reason, do not use the Builder's "Update" button on this device: if its copy of the YAML is stale, it recompiles that copy and overwrites the firmware you flashed from your PC.
 
 ---
 
 ## LED Animations
 
-The Pyramid has two physical strips, each with two independently-controllable channel groups — four zones total. Physical mapping: ch0=back-left, ch1=front-left, ch2=front-right, ch3=back-right.
+The Pyramid's STM32 exposes **one register per LED**, so the `pyramidrgb` light is a true **addressable light of 28 LEDs** (4 zones x 7). Logical ring order, seen from above with the tip as the front: `0-6` back-left | `7-13` front-left | `14-20` front-right | `21-27` back-right. The effects are ported from the Voice PE and adapted from 12 to 28 LEDs:
 
-| Phase | Animation | Color |
+| State | Effect | Look |
 |---|---|---|
-| Idle | Amber static (brightness controlled by HA slider, gamma 2.0) | Amber (r=1.0 g=0.55 b=0.05) |
-| Idle → sleep (2 min) | 3s fade-out, then off | — |
-| Wake word detected | White front→back sweep | White |
-| Listening | Stepped breathing, ~2.3s cycle, 3 steps each way | Cyan |
-| Thinking | Clockwise chase: FL→FR→BR→BL, ~760ms/rotation | Amber |
-| Replying | Static 100% | Green |
-| Error | Static 100% | Red |
-| Muted | Static dim | Dark red |
-| Timer | Static 100% | Cyan |
+| Idle | Idle Sparkle | Cool blue with a soft per-LED sparkle (starry sky) |
+| Idle for 2 min | Fade-out | 3 s fade, then off |
+| Wake word detected | White sweep | From the back to the front tip, both sides meeting at the tip |
+| Listening | Listening | Cyan breathing, about 1.6 s per cycle |
+| Thinking | Thinking | Amber comet spinning around the ring |
+| Replying | Solid | Green |
+| Error | Error Pulse | Red breathing |
+| Muted | Solid, dim | Dark red |
+| Timer counting | Timer Tick | Blue arc, the lit fraction of the ring is the time left |
+| Timer ringing | Timer Ring | Orange pulse |
+| WiFi or HA down | Offline Twinkle | Flickering red ember |
 
-The `idle_sleep_timer` script (mode: restart) counts 2 minutes of idle/muted inactivity, then fades out all strips over 3s. Any touch or wake word calls `wake_from_sleep`, which cancels the timer and restores the idle state. This prevents the amber idle glow from staying on all night.
+A central `update_leds` script picks the effect with a priority chain: offline > timer ringing > error > voice phases > timer counting > muted > idle. The `idle_sleep_timer` script (mode: restart) counts 2 minutes of idle inactivity and then fades the LEDs out; any wake word or voice activity calls `wake_from_sleep`, which cancels the timer and restores the state.
 
-The HA "RGB Master Brightness" slider (0–100) controls idle brightness with a gamma 2.0 curve for perceptually linear response.
+The "RGB Master Brightness" number (0-100) sets the brightness in hardware (STM32 registers 0x10/0x11), so it never double-attenuates the effect colors.
 
 ---
 
-## `components/pyramidrgb/` — LED Fix
+## `components/pyramidrgb/` - LED driver
 
-The upstream `pyramidrgb` component had a fundamental timing problem. ESPHome's `rgb` light platform calls `write_state()` separately for R, G, and B on each frame. The upstream component immediately issued I2C writes on each call — meaning every color update produced two frames of incorrect intermediate colors and up to 84+ I2C transactions per animation tick. This caused visible flickering and, unexpectedly, added measurable latency to the voice pipeline by starving I2C bus activity.
+The upstream `pyramidrgb` component had a timing problem. ESPHome's `rgb` light platform calls `write_state()` separately for R, G, and B on each frame, and the upstream component issued I2C writes immediately on every call. Each color update produced intermediate wrong colors and up to 84+ I2C transactions per animation tick, which caused visible flicker and added latency to the voice pipeline by starving the I2C bus.
 
-**Fix (from [malonestar/echo-pyramid](https://github.com/malonestar/echo-pyramid)):** Deferred writes via dirty flags. `write_state()` updates an in-memory buffer and sets a dirty flag. `loop()` flushes dirty channels once per tick, after R, G, and B have all settled. One correct I2C write per channel per frame, zero intermediate garbage states.
-
-An additional fix reverts an attempted burst write optimization: the STM32's I2C slave has an auto-increment limit shorter than a full 28-byte burst, causing pink corruption on specific LEDs. The component uses 7 individual per-LED writes per channel flush instead.
-
-See [`components/README.md`](components/README.md) for the complete technical write-up.
+- **Dirty flags** (from [malonestar/echo-pyramid](https://github.com/malonestar/echo-pyramid)): `write_state()` updates an in-memory buffer and the flush happens once per tick, after R, G, and B have settled.
+- **Addressable light** (`light/`, since v0.5): `PyramidRGBLight` is an `AddressableLight` with 28 individual LEDs, so effects can address each LED. It keeps a cache of the last frame per zone and sends over I2C only the zones that changed.
+- **Write mode:** by default one zone is written per transaction (29 bytes). If your STM32 does not auto-increment registers on such a write (symptom: pink corruption on specific LEDs), set `per_led_write: true` for 7 transactions of 5 bytes per zone. Zones 0 and 1 have an inverted hardware index so that the visual flow around the ring is continuous.
 
 > The `pyramidrgb` fix was developed by [malonestar/echo-pyramid](https://github.com/malonestar/echo-pyramid), building on the original component from [m5stack/esphome-yaml](https://github.com/m5stack/esphome-yaml). We adapted it for the EchoS3R satellite configuration.
 
@@ -173,7 +174,7 @@ If new firmware crashes within 60 seconds of boot, ESP-IDF automatically reverts
 
 ### 1. Prerequisites
 
-- [ESPHome](https://esphome.io/) CLI installed on a PC (not the HA add-on — see above)
+- [ESPHome](https://esphome.io/) 2026.6 or newer, CLI installed on a PC (not the HA add-on — see above)
 - Home Assistant with a configured [Voice Assistant pipeline](https://www.home-assistant.io/voice_control/)
 - M5Stack Atom EchoS3R mounted on Voice Pyramid Base
 
@@ -214,10 +215,9 @@ esphome upload echos3r-satellite.yaml --device <IP_ADDRESS>
 ## Repository Structure
 
 ```
-echos3r-satellite.yaml      ← Main firmware (v0.3.0)
-components/pyramidrgb/      ← Local component override: deferred I2C writes
-components/README.md        ← Detailed pyramidrgb fix write-up
-secrets.yaml.example        ← Credentials template
+echos3r-satellite.yaml      <- Main firmware (v0.5.2)
+components/pyramidrgb/      <- Local component: output (dirty flags) and addressable light
+secrets.yaml.example        <- Credentials template
 ```
 
 ---
