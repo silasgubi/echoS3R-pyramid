@@ -4,8 +4,7 @@ Versions follow [Semantic Versioning](https://semver.org/). Versions before 0.6.
 
 ## 0.6.0 - 2026-10-23
 
-Protection release. Our Voice Pyramid base failed (I2C bus stuck, chips silent, base hot on its own), and v0.5.2 had
-no protection at all. Updating is strongly recommended.
+Protection release: v0.5.2 had no protection at all. Updating is strongly recommended.
 
 ### Added
 

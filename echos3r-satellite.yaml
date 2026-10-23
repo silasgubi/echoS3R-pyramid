@@ -5,11 +5,10 @@
 # mode after reboot loops, base I2C fault watch; music releases the mic)
 # 0.5.2: fast wake (Wake Sound switch OFF by default), volume_max 0.70
 #
-# Why 0.6.0: one Voice Pyramid base failed after two unexpected reboots. Its I2C
-# bus (GPIO38/39) got SDA stuck low, no chip answered the scan and the base got
-# hot even on its own. The firmware cannot measure the base temperature (the
-# ESP32-S3 sensor measures the Atom's chip), so it watches what it can: chip
-# temperature, reboot loops and whether the base chips still answer on I2C.
+# Protection kit: the firmware cannot measure the base temperature (the ESP32-S3
+# sensor measures the Atom's chip), so it watches what it can: chip temperature,
+# reboot loops and whether the base chips still answer on I2C (a stuck bus, with
+# SDA held low and no chip answering, is the failure it looks for).
 # None of this replaces a good power supply: give the base its own USB supply.
 #
 # Note: do NOT use the ESPHome Builder "Update" button in Home Assistant if its copy of

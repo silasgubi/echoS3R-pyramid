@@ -6,12 +6,8 @@ This combination is **not the standard setup** — M5Stack's official firmware t
 
 When we built this, we couldn't find any existing firmware or documentation for this hardware pair. This repo is what we wish had existed.
 
-> [!WARNING]
-> **Our Voice Pyramid base failed in October 2026**, and we strongly suggest updating to **v0.6.0 or newer**.
->
-> After two unexpected reboots, the base's I2C bus got stuck (SDA held low), none of its chips answered anymore, and the base got hot even with the Atom removed. M5Stack confirmed a hardware defect and replaced it under warranty. We do not know the root cause. It was one unit, and it shared a USB power strip with other devices. Versions up to v0.5.2 had no protection at all: the amp stayed on, and a reboot loop could go on forever.
->
-> v0.6.0 adds a [protection kit](#protection-kit-v060). Also give the base **its own good USB power supply**, and keep it where heat can escape. Firmware cannot measure the base temperature, so it cannot replace that.
+> [!NOTE]
+> **Update to v0.6.0 or newer.** Earlier versions had no protection: the amp stayed always on and a reboot loop could go on forever. v0.6.0 adds a [protection kit](#protection-kit-v060). Give the base its own USB power supply and keep it where heat can escape.
 
 ---
 
@@ -140,7 +136,7 @@ M5Stack boards have little hardware protection, so the firmware adds what it can
 | Protection | What it does |
 |---|---|
 | **Thermal protection** | Reads the ESP32-S3 chip temperature every 30 s. At 70 °C it limits the volume to 0.5; at 80 °C it switches the amp off. It recovers with hysteresis (amp back below 75 °C, volume free below 65 °C). Normal chip temperature in our room was 43-54 °C. |
-| **Base fault watch** | Every 30 s it probes the base chips on I2C (STM32, AW87559, PI4IOE5V6408, ES8311, ES7210, Si5351). If they fail two checks in a row, the amp is switched off and **Base Fault** turns on in HA, listing the missing chips in the log. This is the failure we saw on our dead base. |
+| **Base fault watch** | Every 30 s it probes the base chips on I2C (STM32, AW87559, PI4IOE5V6408, ES8311, ES7210, Si5351). If they fail two checks in a row, the amp is switched off and **Base Fault** turns on in HA, listing the missing chips in the log. |
 | **Safe mode** | 3 boots in a row that do not last 1 minute put the device in safe mode (Wi-Fi and OTA only, retries a normal boot after 5 minutes). A software reboot does not reset the base chips, so safe mode switches the amp and the LEDs off with direct I2C writes. The ESPHome default is 10 attempts. |
 | **Amp lock** | While the thermal or base protection is active, nothing (HA, the boot sequence) can switch the amp back on. |
 | **Diagnostics** | `Chip Temperature`, `Thermal Protection` (Normal / Volume limited / Amp off), `Base Fault`, `Reset Reason` (a brownout means the supply voltage dropped) and `Uptime`. |
