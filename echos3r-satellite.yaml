@@ -1,8 +1,9 @@
 # =============================================================================
 # ECHO PYRAMID (Atom EchoS3R + Voice Pyramid Base)
 # =============================================================================
-# Version: 0.6.0 (protection kit: chip temperature, thermal protection, safe
-# mode after reboot loops, base I2C fault watch; music releases the mic)
+# Version: 0.6.1 (builds on ESPHome 2026.10: audio files are now const)
+# 0.6.0: protection kit (chip temperature, thermal protection, safe mode after
+# reboot loops, base I2C fault watch; music releases the mic)
 # 0.5.2: fast wake (Wake Sound switch OFF by default), volume_max 0.70
 #
 # Protection kit: the firmware cannot measure the base temperature (the ESP32-S3
@@ -67,7 +68,7 @@ esphome:
       - script.execute:
           id: play_sound
           priority: true
-          sound_file: !lambda return id(wake_word_triggered_sound);
+          sound_file: !lambda return const_cast<audio::AudioFile *>(id(wake_word_triggered_sound));
       - delay: 250ms
       - switch.turn_on: speaker_enable
       - delay: 25s
@@ -628,7 +629,7 @@ switch:
       - script.execute:
           id: play_sound
           priority: false
-          sound_file: !lambda return id(mute_off_sound);
+          sound_file: !lambda return const_cast<audio::AudioFile *>(id(mute_off_sound));
       - microphone.unmute:
       - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
       - script.execute: idle_sleep_timer
@@ -637,7 +638,7 @@ switch:
       - script.execute:
           id: play_sound
           priority: false
-          sound_file: !lambda return id(mute_on_sound);
+          sound_file: !lambda return const_cast<audio::AudioFile *>(id(mute_on_sound));
       - microphone.mute:
       - lambda: id(voice_assistant_phase) = ${voice_assist_muted_phase_id};
       - script.execute: update_leds
@@ -805,7 +806,7 @@ micro_wake_word:
                 - script.execute:
                     id: play_sound
                     priority: true
-                    sound_file: !lambda return id(wake_word_triggered_sound);
+                    sound_file: !lambda return const_cast<audio::AudioFile *>(id(wake_word_triggered_sound));
                 - wait_until:
                     condition:
                       not:
@@ -900,7 +901,7 @@ voice_assistant:
           - script.execute:
               id: play_sound
               priority: true
-              sound_file: !lambda return id(error_cloud_expired);
+              sound_file: !lambda return const_cast<audio::AudioFile *>(id(error_cloud_expired));
   on_client_connected:
     - lambda: id(init_in_progress) = false;
     # The stop model stays disabled outside the TTS reply window.
@@ -1247,6 +1248,8 @@ script:
   - id: play_sound
     parameters:
       priority: bool
+      # ESPHome 2026.10 made audio files const; script parameter types cannot
+      # contain spaces, so callers const_cast (play_file takes a const pointer).
       sound_file: "audio::AudioFile*"
     then:
       - lambda: |-

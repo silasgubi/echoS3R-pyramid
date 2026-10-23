@@ -2,6 +2,15 @@
 
 Versions follow [Semantic Versioning](https://semver.org/). Versions before 0.6.0 are described in the git history.
 
+## 0.6.1 - 2026-10-23
+
+### Fixed
+
+- Builds on ESPHome 2026.10. That release made the embedded sound files `const`, and compiling failed in the
+  `play_sound` script with `invalid conversion from 'const esphome::audio::AudioFile*'`. Script parameter types
+  cannot be `const`, so the callers now `const_cast` the pointer (`play_file` only reads it). Older ESPHome
+  versions still build.
+
 ## 0.6.0 - 2026-10-23
 
 Protection release: v0.5.2 had no protection at all. Updating is strongly recommended.

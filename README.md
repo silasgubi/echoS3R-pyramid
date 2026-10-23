@@ -247,7 +247,7 @@ If new firmware crashes within 60 seconds of boot, ESP-IDF automatically reverts
 
 ### 1. Prerequisites
 
-- [ESPHome](https://esphome.io/) 2026.6 or newer, CLI installed on a PC (not the HA add-on — see above)
+- [ESPHome](https://esphome.io/) 2026.6 or newer (tested with 2026.10), CLI installed on a PC (not the HA add-on — see above)
 - Home Assistant with a configured [Voice Assistant pipeline](https://www.home-assistant.io/voice_control/)
 - M5Stack Atom EchoS3R mounted on Voice Pyramid Base
 
@@ -289,7 +289,7 @@ esphome upload echos3r-satellite.yaml --device <IP_ADDRESS>
 ## Repository Structure
 
 ```
-echos3r-satellite.yaml      <- Main firmware (v0.6.0)
+echos3r-satellite.yaml      <- Main firmware (v0.6.1)
 CHANGELOG.md                <- Version history
 components/pyramidrgb/      <- Local component: output (dirty flags) and addressable light
 secrets.yaml.example        <- Credentials template
