@@ -990,8 +990,8 @@ text_sensor:
     icon: "mdi:thermometer-alert"
     entity_category: diagnostic
 
-# Every 30 s, probe the base chips (address only, no data). Covers the failure
-# seen on a dead base: SDA stuck low and no chip answering.
+# Every 30 s, probe the base chips (address only, no data). Catches a stuck
+# bus: SDA held low and no chip answering.
 interval:
   - interval: 30s
     then:
