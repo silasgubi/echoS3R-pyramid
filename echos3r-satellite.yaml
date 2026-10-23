@@ -1,8 +1,17 @@
 # =============================================================================
 # ECHO PYRAMID (Atom EchoS3R + Voice Pyramid Base)
 # =============================================================================
-# Version: 0.5.2 (fast wake: the Wake Sound switch defaults to OFF, which removes ~2s of
-# I2S conflict between the chime and the mic; volume_max raised to 0.70)
+# Version: 0.6.0 (protection kit: chip temperature, thermal protection, safe
+# mode after reboot loops, base I2C fault watch; music releases the mic)
+# 0.5.2: fast wake (Wake Sound switch OFF by default), volume_max 0.70
+#
+# Why 0.6.0: one Voice Pyramid base failed after two unexpected reboots. Its I2C
+# bus (GPIO38/39) got SDA stuck low, no chip answered the scan and the base got
+# hot even on its own. The firmware cannot measure the base temperature (the
+# ESP32-S3 sensor measures the Atom's chip), so it watches what it can: chip
+# temperature, reboot loops and whether the base chips still answer on I2C.
+# None of this replaces a good power supply: give the base its own USB supply.
+#
 # Note: do NOT use the ESPHome Builder "Update" button in Home Assistant if its copy of
 # this firmware is stale: it recompiles that copy and overwrites the firmware you
 # flashed from here. Always build and flash from the same source, and keep the Builder
@@ -92,6 +101,56 @@ api:
 ota:
   - platform: esphome
     password: !secret echo_pyramid_ota_password
+
+# Reboot loop protection: 3 boots that do not last 1 min -> safe mode (only
+# Wi-Fi and OTA, no audio or LEDs); after 5 min it tries a normal boot again.
+# The ESPHome default is 10 attempts. A software reboot does not reset the base
+# chips, so they keep their last state (amp enabled, LEDs lit). Safe mode does
+# not set up the I2C bus, so this bit-bangs writes to two chips on GPIO38/39:
+# - PI4IOE5V6408 (0x43) reg 0x01 bit 0 = software reset: back to power-on
+#   defaults (all pins inputs), which releases the AW87559 enable line
+# - STM32 (0x1A) regs 0x10/0x11 = 0: both LED strips dark
+# It never waits on the bus, so a stuck bus cannot hang it.
+safe_mode:
+  num_attempts: 3
+  boot_is_good_after: 1min
+  reboot_timeout: 5min
+  on_safe_mode:
+    - lambda: |-
+        gpio_set_direction(GPIO_NUM_18, GPIO_MODE_OUTPUT);
+        gpio_set_level(GPIO_NUM_18, 0);
+        const gpio_num_t sda = GPIO_NUM_38, scl = GPIO_NUM_39;
+        auto release = [](gpio_num_t p) {
+          gpio_set_direction(p, GPIO_MODE_INPUT);
+          gpio_set_pull_mode(p, GPIO_PULLUP_ONLY);
+        };
+        auto pull_low = [](gpio_num_t p) {
+          gpio_set_direction(p, GPIO_MODE_OUTPUT);
+          gpio_set_level(p, 0);
+        };
+        auto wait = []() { delayMicroseconds(10); };
+        auto send_byte = [&](uint8_t b) {
+          for (int i = 7; i >= 0; i--) {
+            if ((b >> i) & 1) release(sda); else pull_low(sda);
+            wait(); release(scl); wait(); pull_low(scl); wait();
+          }
+          release(sda); wait(); release(scl); wait();
+          const bool ack = gpio_get_level(sda) == 0;
+          pull_low(scl); wait();
+          return ack;
+        };
+        auto write_reg = [&](uint8_t addr, uint8_t reg, uint8_t val) {
+          release(sda); release(scl); wait();
+          pull_low(sda); wait(); pull_low(scl); wait();
+          const bool ok = send_byte(addr << 1) && send_byte(reg) && send_byte(val);
+          pull_low(sda); wait(); release(scl); wait(); release(sda); wait();
+          return ok;
+        };
+        const bool amp_ok = write_reg(0x43, 0x01, 0x01);
+        const bool led1_ok = write_reg(0x1A, 0x10, 0x00);
+        const bool led2_ok = write_reg(0x1A, 0x11, 0x00);
+        ESP_LOGW("protection", "Safe mode after repeated reboots: amp off (%s), LEDs off (%s)",
+                 amp_ok ? "ok" : "no ACK", (led1_ok && led2_ok) ? "ok" : "no ACK");
 
 wifi:
   ssid: !secret wifi_ssid
@@ -412,6 +471,18 @@ media_player:
           then:
             - lambda: id(voice_assistant_phase) = ${voice_assist_muted_phase_id};
             - script.execute: update_leds
+    # The mic and the speaker share the I2S bus with an exclusive lock: with the
+    # wake word running, the speaker fails with "Parent bus is busy" and music
+    # stays "playing" with no sound, while the driver keeps retrying. For music,
+    # release the mic; on_idle starts the wake word again when it ends.
+    # Side effect: "Okay Nabu" does not work during music (the button does).
+    on_play:
+      - if:
+          condition:
+            not:
+              voice_assistant.is_running:
+          then:
+            - script.execute: stop_wake_word
     on_idle:
       - if:
           condition:
@@ -477,6 +548,13 @@ binary_sensor:
     on_release:
       - script.stop: volume_hold_down
 
+  - platform: template
+    id: base_fault_sensor
+    name: "Base Fault"
+    device_class: problem
+    entity_category: diagnostic
+    lambda: return id(base_fault);
+
   - platform: gpio
     pin:
       number: GPIO41
@@ -527,6 +605,18 @@ switch:
         output: true
     icon: "mdi:volume-high"
     restore_mode: ALWAYS_OFF
+    # While a protection is active (chip too hot or base not answering on I2C),
+    # nobody (HA, the boot sequence) can switch the amp back on.
+    on_turn_on:
+      - if:
+          condition:
+            lambda: return id(thermal_level) >= 2 || id(base_fault);
+          then:
+            - logger.log:
+                level: WARN
+                tag: protection
+                format: "Amp stays off: a protection is active"
+            - switch.turn_off: speaker_enable
 
   - platform: template
     name: Mute Microphone
@@ -868,12 +958,64 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: '0'
+  # Thermal protection: 0 normal, 1 volume limited, 2 amp off.
+  - id: thermal_level
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Base I2C watch: fault after 2 failed checks in a row, cleared after 2 good ones.
+  - id: base_fault
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: base_check_streak
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+# Protection kit: uptime and the reason for the last reset (brownout = the
+# supply voltage dropped). The internal sensor measures the Atom's chip, not
+# the base.
+debug:
+  update_interval: 60s
+
+text_sensor:
+  - platform: debug
+    reset_reason:
+      name: "Reset Reason"
+      entity_category: diagnostic
+
+  - platform: template
+    id: thermal_status
+    name: "Thermal Protection"
+    icon: "mdi:thermometer-alert"
+    entity_category: diagnostic
+
+# Every 30 s, probe the base chips (address only, no data). Covers the failure
+# seen on a dead base: SDA stuck low and no chip answering.
+interval:
+  - interval: 30s
+    then:
+      - script.execute: base_i2c_check
 
 # Touch 3 and 4 disabled (erratic behavior; STM32 TSC/AEC).
 # Left swipe: up=vol+, down=vol-. Right swipe: ignored.
 sensor:
   - platform: wifi_signal
     name: "WiFi Signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: internal_temperature
+    id: chip_temp
+    name: "Chip Temperature"
+    update_interval: 30s
+    entity_category: diagnostic
+    on_value:
+      - script.execute: thermal_check
+
+  - platform: uptime
+    name: "Uptime"
     update_interval: 60s
     entity_category: diagnostic
 
@@ -1031,6 +1173,77 @@ script:
             - script.execute: idle_sleep_timer
           else:
             - lambda: id(voice_assistant_phase) = ${voice_assist_muted_phase_id};
+
+  # Thermal protection in the firmware itself (works even with HA down), on
+  # every Chip Temperature reading (30 s). Atom chip baseline: 43-54 C.
+  # Up: >= 70 C limits the volume to 0.5; >= 80 C switches the amp off.
+  # Down with hysteresis: amp back below 75 C, volume free below 65 C.
+  - id: thermal_check
+    then:
+      - lambda: |-
+          const float t = id(chip_temp).state;
+          if (std::isnan(t)) return;
+          const int before = id(thermal_level);
+          int level = before;
+          if (t >= 80.0f) level = 2;
+          else if (t >= 70.0f && level < 1) level = 1;
+          if (level == 2 && t < 75.0f) level = 1;
+          if (level >= 1 && t < 65.0f) level = 0;
+          id(thermal_level) = level;
+
+          if (level >= 1 && id(echo_pyramid_player).volume > 0.5f) {
+            id(echo_pyramid_player).make_call().set_volume(0.5f).perform();
+          }
+          if (level == 2 && id(speaker_enable).state) {
+            id(speaker_enable).turn_off();
+          }
+          if (before == 2 && level < 2 && !id(base_fault)) {
+            id(speaker_enable).turn_on();
+          }
+          if (level != before) {
+            ESP_LOGW("protection", "Chip at %.1f C: thermal level %d -> %d", t, before, level);
+          }
+          if (level != before || !id(thermal_status).has_state()) {
+            const char *txt[] = {"Normal", "Volume limited", "Amp off"};
+            id(thermal_status).publish_state(txt[level]);
+          }
+
+  # Base I2C watch: probes the chips of the base. 2 failed checks in a row ->
+  # amp off and "Base Fault" on in HA; 2 good checks in a row -> back to normal.
+  - id: base_i2c_check
+    then:
+      - lambda: |-
+          struct Chip { uint8_t addr; const char *name; };
+          static const Chip chips[] = {
+            {0x1A, "STM32"}, {0x5B, "AW87559"}, {0x43, "PI4IOE5V6408"},
+            {0x18, "ES8311"}, {0x40, "ES7210"}, {0x60, "Si5351"},
+          };
+          std::string missing;
+          for (const auto &c : chips) {
+            if (id(ext_bus)->write(c.addr, nullptr, 0) != i2c::ERROR_OK) {
+              if (!missing.empty()) missing += ", ";
+              missing += c.name;
+            }
+          }
+          const bool ok = missing.empty();
+          int streak = id(base_check_streak);
+          // positive = good checks in a row, negative = failed checks in a row
+          streak = ok ? (streak > 0 ? streak + 1 : 1) : (streak < 0 ? streak - 1 : -1);
+          id(base_check_streak) = streak;
+          if (!ok) {
+            ESP_LOGW("protection", "Base chips not answering on I2C: %s", missing.c_str());
+          }
+          if (!id(base_fault) && streak <= -2) {
+            id(base_fault) = true;
+            ESP_LOGE("protection", "Base fault: amp off until the base answers again");
+            if (id(speaker_enable).state) id(speaker_enable).turn_off();
+            id(base_fault_sensor).publish_state(true);
+          } else if (id(base_fault) && streak >= 2) {
+            id(base_fault) = false;
+            ESP_LOGW("protection", "Base answers again: fault cleared");
+            id(base_fault_sensor).publish_state(false);
+            if (id(thermal_level) < 2) id(speaker_enable).turn_on();
+          }
 
   - id: play_sound
     parameters:

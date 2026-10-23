@@ -6,6 +6,13 @@ This combination is **not the standard setup** — M5Stack's official firmware t
 
 When we built this, we couldn't find any existing firmware or documentation for this hardware pair. This repo is what we wish had existed.
 
+> [!WARNING]
+> **Our Voice Pyramid base failed in October 2026**, and we strongly suggest updating to **v0.6.0 or newer**.
+>
+> After two unexpected reboots, the base's I2C bus got stuck (SDA held low), none of its chips answered anymore, and the base got hot even with the Atom removed. M5Stack confirmed a hardware defect and replaced it under warranty. We do not know the root cause. It was one unit, and it shared a USB power strip with other devices. Versions up to v0.5.2 had no protection at all: the amp stayed on, and a reboot loop could go on forever.
+>
+> v0.6.0 adds a [protection kit](#protection-kit-v060). Also give the base **its own good USB power supply**, and keep it where heat can escape. Firmware cannot measure the base temperature, so it cannot replace that.
+
 ---
 
 ## Hardware
@@ -19,8 +26,10 @@ The EchoS3R mounts into the Pyramid's center slot. The Pyramid adds a quad-mic a
 
 ---
 
-## Features (v0.5.2)
+## Features (v0.6.0)
 
+- Protection kit: chip temperature with thermal protection, safe mode after reboot loops, a watch on the base chips, reset reason and uptime (see below)
+- Music from Home Assistant / Music Assistant plays reliably (the mic releases the shared I2S bus while music plays)
 - On-device wake word with `micro_wake_word` (`okay_nabu`, `hey_jarvis`, `hey_mycroft`) and a sensitivity select; the engine can also run in Home Assistant
 - Full voice pipeline with timers, mute switch and button, and a 10 s long press for factory reset
 - 28 individually addressable LEDs with Voice PE-style effects (idle, listening, thinking, timers, errors, offline)
@@ -50,13 +59,14 @@ The EchoS3R mounts into the Pyramid's center slot. The Pyramid adds a quad-mic a
 
 | Address | Device |
 |---|---|
+| 0x18 | ES8311 DAC (speaker) |
 | 0x1A | STM32 — PyramidRGB + PyramidTouch |
 | 0x40 | ES7210 ADC (mic array) |
-| 0x43 | PI4IOE5V6408 GPIO expander |
+| 0x43 | PI4IOE5V6408 GPIO expander (pin 0 enables the AW87559) |
 | 0x5B | AW87559 amplifier |
 | 0x60 | SI5351 clock generator |
 
-> Note: address 0x18 appears on I2C scan but is unidentified. Address 0x77 (BME688 ENV Pro) is absent on this hardware — don't reference it.
+> Note: address 0x77 (BME688 ENV Pro) is absent on this hardware, so don't reference it.
 
 ---
 
@@ -116,6 +126,73 @@ Defining a software I2C bus on GPIO1/GPIO2 causes a crash on boot. The ESP-IDF O
 ### 7. Don't compile with the HA ESPHome Builder add-on
 
 This firmware includes TF Lite Micro for on-device wake word detection. The HA Builder runs on a Raspberry Pi with limited RAM — the compiler (`cc1plus`) gets OOM-killed mid-build. **Always compile on a PC** with the ESPHome CLI and upload via OTA. For the same reason, do not use the Builder's "Update" button on this device: if its copy of the YAML is stale, it recompiles that copy and overwrites the firmware you flashed from your PC.
+
+### 8. Music needs the mic to let go of the I2S bus
+
+The mic and the speaker share the I2S bus with an exclusive lock. With the wake word running, the speaker fails with `Parent bus is busy`: music from Music Assistant shows "playing" with no sound while the driver keeps retrying. Since v0.6.0, `on_play` stops the wake word and `on_idle` starts it again when the music ends. Side effect: "Okay Nabu" does not work while music plays (the button does).
+
+---
+
+## Protection Kit (v0.6.0)
+
+M5Stack boards have little hardware protection, so the firmware adds what it can. Everything runs on the device and works even if Home Assistant is down.
+
+| Protection | What it does |
+|---|---|
+| **Thermal protection** | Reads the ESP32-S3 chip temperature every 30 s. At 70 °C it limits the volume to 0.5; at 80 °C it switches the amp off. It recovers with hysteresis (amp back below 75 °C, volume free below 65 °C). Normal chip temperature in our room was 43-54 °C. |
+| **Base fault watch** | Every 30 s it probes the base chips on I2C (STM32, AW87559, PI4IOE5V6408, ES8311, ES7210, Si5351). If they fail two checks in a row, the amp is switched off and **Base Fault** turns on in HA, listing the missing chips in the log. This is the failure we saw on our dead base. |
+| **Safe mode** | 3 boots in a row that do not last 1 minute put the device in safe mode (Wi-Fi and OTA only, retries a normal boot after 5 minutes). A software reboot does not reset the base chips, so safe mode switches the amp and the LEDs off with direct I2C writes. The ESPHome default is 10 attempts. |
+| **Amp lock** | While the thermal or base protection is active, nothing (HA, the boot sequence) can switch the amp back on. |
+| **Diagnostics** | `Chip Temperature`, `Thermal Protection` (Normal / Volume limited / Amp off), `Base Fault`, `Reset Reason` (a brownout means the supply voltage dropped) and `Uptime`. |
+
+**Limits:** the temperature sensor is inside the Atom's chip, not in the base, so it cannot see a base that heats up on its own. The base fault watch catches that case only once the chips stop answering. The PI4IOE5V6408 reset in safe mode was written from the datasheet and has not been tested on a failing unit yet.
+
+### Suggested Home Assistant alerts
+
+Replace the entity ids with yours (Developer Tools > States) and the notify action with your phone's:
+
+```yaml
+- alias: Echo Pyramid base fault
+  triggers:
+    - trigger: state
+      entity_id: binary_sensor.YOUR_PYRAMID_BASE_FAULT
+      to: "on"
+  actions:
+    - action: notify.mobile_app_YOUR_PHONE
+      data:
+        title: Echo Pyramid
+        message: The base chips stopped answering. The amp is off. Unplug the base and check whether it is hot.
+
+- alias: Echo Pyramid chip hot
+  triggers:
+    - trigger: numeric_state
+      entity_id: sensor.YOUR_PYRAMID_CHIP_TEMPERATURE
+      above: 70
+      for: "00:10:00"
+  actions:
+    - action: notify.mobile_app_YOUR_PHONE
+      data:
+        title: Echo Pyramid
+        message: Chip above 70 C for 10 minutes. Check the power supply and airflow.
+
+- alias: Echo Pyramid unexpected reboot
+  triggers:
+    - trigger: state
+      entity_id: sensor.YOUR_PYRAMID_UPTIME
+  conditions:
+    - condition: template
+      value_template: >-
+        {{ trigger.from_state.state | float(0) > trigger.to_state.state | float(0) }}
+  actions:
+    - action: notify.mobile_app_YOUR_PHONE
+      data:
+        title: Echo Pyramid
+        message: >-
+          The device rebooted (reason: {{ states('sensor.YOUR_PYRAMID_RESET_REASON') }}).
+          Two in a short time deserve a look.
+```
+
+An OTA update also counts as a reboot in the last alert, so expect one message after each update.
 
 ---
 
@@ -209,13 +286,15 @@ esphome upload echos3r-satellite.yaml --device <IP_ADDRESS>
 - **Audio interference:** Suspected crosstalk from the Grove cable running near the speaker. Present but minor.
 - **IR range:** Onboard IR LED only reliable at close range, aimed directly at the AC unit. External LED needed for room-scale operation.
 - **Boot pop/click:** Amplitude reduced but a faint click on power-up remains.
+- **Amp always on:** outside the protections, the AW87559 stays enabled all the time (switching it per playback is not tested yet). An amp that only runs while audio plays would be safer.
 
 ---
 
 ## Repository Structure
 
 ```
-echos3r-satellite.yaml      <- Main firmware (v0.5.2)
+echos3r-satellite.yaml      <- Main firmware (v0.6.0)
+CHANGELOG.md                <- Version history
 components/pyramidrgb/      <- Local component: output (dirty flags) and addressable light
 secrets.yaml.example        <- Credentials template
 ```
